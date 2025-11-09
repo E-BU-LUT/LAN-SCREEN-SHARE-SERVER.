@@ -1,151 +1,211 @@
-import cv2
-import numpy as np
-import pyautogui
+#!/usr/bin/env python3
+"""
+Yerel Ağ Ekran Paylaşım Sunucusu
+Bilgisayarınızın ekranını yerel ağdaki diğer cihazlara web tarayıcısı üzerinden yayınlar.
+"""
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import base64
+import json
+import socket
+from PIL import ImageGrab
+import io
+import threading
 import time
+import tkinter as tk
+from tkinter import messagebox
 
-# Ayarlar
-ENABLE_MOUSE_CONTROL = True  # Fare kontrolünü aktifleştir
-SHOW_DEBUG_TEXT = True  # Test yazılarını göster
-
-# Ekran boyutunu al
-screen_width, screen_height = pyautogui.size()
-
-# PyAutoGUI güvenlik özelliğini kapat
-pyautogui.FAILSAFE = False
-
-# Kamera başlat
-cap = cv2.VideoCapture(0)
-
-# Tıklama için değişkenler
-previous_aspect_ratio = None
-click_threshold = 0.3  # En-boy oranındaki değişim eşiği
-click_cooldown = 0.5  # Tıklamalar arası bekleme süresi (saniye)
-last_click_time = 0
-
-# Smoothing için değişkenler
-smooth_factor = 0.5  # 0-1 arası, yüksek değer daha yumuşak hareket
-prev_x, prev_y = screen_width // 2, screen_height // 2
-
-print("Program başlatıldı...")
-print(f"Fare kontrolü: {'AÇIK' if ENABLE_MOUSE_CONTROL else 'KAPALI'}")
-print(f"Test yazıları: {'AÇIK' if SHOW_DEBUG_TEXT else 'KAPALI'}")
-print("Çıkmak için 'q' tuşuna basın")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    
-    # Aynalama
-    frame = cv2.flip(frame, 1)
-    
-    # HSV'ye dönüştür
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    # Yeşil renk aralığı (geniş aralık)
-    lower_green = np.array([25, 40, 40])
-    upper_green = np.array([85, 255, 255])
-    lower_purple = np.array([135, 60, 130])
-    upper_purple = np.array([255, 255, 255])
-    
-    # Maske oluştur
-    mask = cv2.inRange(hsv, lower_green, upper_green)
-    #mask = cv2.inRange(hsv, lower_purple, upper_purple)
-    
-    # Morfolojik işlemler (gürültü azaltma)
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    
-    # Konturları bul
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if contours:
-        # En büyük konturu bul
-        largest_contour = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest_contour)
-        
-        # Minimum alan kontrolü
-        if area > 1000:
-            # Dörtgen yaklaşımı
-            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
-            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+class ScreenShareHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            # Ana sayfa - görüntüleyici
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
             
-            # Merkez noktasını hesapla
-            M = cv2.moments(largest_contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Ekran Paylaşımı</title>
+                <style>
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
+                    body {
+                        font-family: Arial, sans-serif;
+                        background: #1a1a1a;
+                        color: #fff;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        padding: 20px;
+                    }
+                    h1 {
+                        margin-bottom: 20px;
+                        color: #4CAF50;
+                    }
+                    #screen {
+                        max-width: 95vw;
+                        max-height: 80vh;
+                        border: 2px solid #4CAF50;
+                        border-radius: 8px;
+                        box-shadow: 0 4px 20px rgba(76, 175, 80, 0.3);
+                    }
+                    #status {
+                        margin-top: 15px;
+                        padding: 10px 20px;
+                        background: #333;
+                        border-radius: 5px;
+                        font-size: 14px;
+                    }
+                    .connected { color: #4CAF50; }
+                    .disconnected { color: #f44336; }
+                    #fps {
+                        margin-top: 10px;
+                        color: #888;
+                        font-size: 12px;
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>🖥️ Ekran Paylaşımı</h1>
+                <img id="screen" alt="Ekran yükleniyor...">
+                <div id="status" class="disconnected">Bağlanıyor...</div>
+                <div id="fps">FPS: 0</div>
                 
-                # Sınırlayıcı kutu
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                
-                # En-boy oranı hesapla
-                aspect_ratio = float(w) / h if h != 0 else 0
-                
-                # Konturu çiz
-                cv2.drawContours(frame, [largest_contour], 0, (0, 255, 0), 2)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
-                
-                # Test yazıları
-                if SHOW_DEBUG_TEXT:
-                    cv2.putText(frame, f"Alan: {int(area)}", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    cv2.putText(frame, f"En-Boy: {aspect_ratio:.2f}", (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    cv2.putText(frame, f"Konum: ({cx}, {cy})", (10, 90),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    cv2.putText(frame, f"Genislik: {w}, Yukseklik: {h}", (10, 120),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                # Fare kontrolü
-                if ENABLE_MOUSE_CONTROL:
-                    # Kamera koordinatlarını ekran koordinatlarına dönüştür
-                    frame_height, frame_width = frame.shape[:2]
-                    screen_x = int(np.interp(cx, [0, frame_width], [0, screen_width]))
-                    screen_y = int(np.interp(cy, [0, frame_height], [0, screen_height]))
+                <script>
+                    const screen = document.getElementById('screen');
+                    const status = document.getElementById('status');
+                    const fpsDisplay = document.getElementById('fps');
+                    let frameCount = 0;
+                    let lastTime = Date.now();
                     
-                    # Smoothing uygula
-                    screen_x = int(prev_x * smooth_factor + screen_x * (1 - smooth_factor))
-                    screen_y = int(prev_y * smooth_factor + screen_y * (1 - smooth_factor))
+                    function updateScreen() {
+                        fetch('/screen')
+                            .then(response => response.json())
+                            .then(data => {
+                                screen.src = 'data:image/jpeg;base64,' + data.image;
+                                status.textContent = 'Bağlı ✓';
+                                status.className = 'connected';
+                                
+                                // FPS hesaplama
+                                frameCount++;
+                                const now = Date.now();
+                                if (now - lastTime >= 1000) {
+                                    fpsDisplay.textContent = `FPS: ${frameCount}`;
+                                    frameCount = 0;
+                                    lastTime = now;
+                                }
+                                
+                                setTimeout(updateScreen, 100); // ~10 FPS
+                            })
+                            .catch(error => {
+                                status.textContent = 'Bağlantı Kesildi ✗';
+                                status.className = 'disconnected';
+                                setTimeout(updateScreen, 2000);
+                            });
+                    }
                     
-                    prev_x, prev_y = screen_x, screen_y
-                    
-                    # Fareyi hareket ettir
-                    pyautogui.moveTo(screen_x, screen_y)
+                    updateScreen();
+                </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode())
+            
+        elif self.path == '/screen':
+            # Ekran görüntüsü API
+            try:
+                # Ekran görüntüsü al
+                screenshot = ImageGrab.grab()
                 
-                # Tıklama algılama (yükseklik azaldığında)
-                if previous_aspect_ratio is not None:
-                    current_time = time.time()
-                    
-                    # En-boy oranı artıyorsa (yükseklik azalıyor)
-                    if aspect_ratio > previous_aspect_ratio + click_threshold:
-                        if current_time - last_click_time > click_cooldown:
-                            if SHOW_DEBUG_TEXT:
-                                cv2.putText(frame, "TIKLAMA ALGILANDI!", (10, 150),
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                            
-                            if ENABLE_MOUSE_CONTROL:
-                                pyautogui.click()
-                            
-                            last_click_time = current_time
+                # JPEG formatına çevir (daha hızlı ve küçük)
+                img_buffer = io.BytesIO()
+                screenshot.save(img_buffer, format='JPEG', quality=75, optimize=True)
+                img_buffer.seek(0)
                 
-                previous_aspect_ratio = aspect_ratio
+                # Base64'e çevir
+                img_base64 = base64.b64encode(img_buffer.read()).decode()
+                
+                # JSON yanıtı gönder
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                response = json.dumps({'image': img_base64})
+                self.wfile.write(response.encode())
+                
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                error = json.dumps({'error': str(e)})
+                self.wfile.write(error.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
     
-    # Durumu göster
-    status_text = f"Fare: {'ON' if ENABLE_MOUSE_CONTROL else 'OFF'} | Test: {'ON' if SHOW_DEBUG_TEXT else 'OFF'}"
-    cv2.putText(frame, status_text, (10, frame.shape[0] - 20),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-    
-    # Göster
-    cv2.imshow('Yesil Dortgen Takip', frame)
-    cv2.imshow('Maske', mask)
-    
-    # Çıkış
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    def log_message(self, format, *args):
+        # Sadece önemli logları göster
+        if '200' in args[1]:
+            return
+        print(f"{self.address_string()} - {format % args}")
 
-# Temizle
-cap.release()
-cv2.destroyAllWindows()
+def get_local_ip():
+    """Bilgisayarın yerel IP adresini bul"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except:
+        return "127.0.0.1"
+
+def show_alert(server_url):
+    """Sunucu adresini alert mesajı ile göster"""
+    root = tk.Tk()
+    root.withdraw()  # Ana pencereyi gizle
+    messagebox.showinfo(
+        "🖥️ Ekran Paylaşım Sunucusu",
+        f"Sunucu başarıyla başlatıldı!\n\n"
+        f"📡 Sunucu Adresi:\n{server_url}\n\n"
+        f"🌐 Yerel ağınızdaki diğer cihazlardan bu adrese\n"
+        f"erişerek ekranınızı izleyebilirler.\n\n"
+        f"⏹️ Durdurmak için konsol penceresinde Ctrl+C'ye basın."
+    )
+    root.destroy()
+
+def main():
+    PORT = 8080
+    local_ip = get_local_ip()
+    server_url = f"http://{local_ip}:{PORT}"
+    
+    print("=" * 60)
+    print("🖥️  EKRAN PAYLAŞIM SUNUCUSU BAŞLATILDI")
+    print("=" * 60)
+    print(f"\n📡 Sunucu adresi: {server_url}")
+    print(f"\n🌐 Diğer cihazlardan erişim için:")
+    print(f"   Tarayıcınızda şu adresi açın: {server_url}")
+    print(f"\n💡 İpucu: Yerel ağınızdaki (aynı modemde) tüm cihazlar bu adrese")
+    print(f"   erişerek ekranınızı canlı olarak izleyebilir.")
+    print(f"\n⏹️  Durdurmak için Ctrl+C tuşlarına basın")
+    print("=" * 60 + "\n")
+    
+    # Alert mesajını ayrı thread'de göster
+    alert_thread = threading.Thread(target=show_alert, args=(server_url,))
+    alert_thread.daemon = True
+    alert_thread.start()
+    
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), ScreenShareHandler)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Sunucu kapatılıyor...")
+        server.shutdown()
+        print("✅ Sunucu başarıyla kapatıldı!")
+
+if __name__ == '__main__':
+    main()
